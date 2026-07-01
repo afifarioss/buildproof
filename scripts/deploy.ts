@@ -1,21 +1,49 @@
 import { ethers, run } from "hardhat";
+
 async function main() {
-  const [dep] = await ethers.getSigners();
-  const AI    = process.env.AI_VERIFIER_ADDRESS!;
-  if (!AI) throw new Error("Set AI_VERIFIER_ADDRESS");
-  const C  = await ethers.getContractFactory("BuildProofNFT");
-  const bp = await C.deploy(AI);
+  const [deployer] = await ethers.getSigners();
+  console.log(`🔵 Deploying BuildProof with account: ${deployer.address}`);
+
+  const AI_VERIFIER = process.env.AI_VERIFIER_ADDRESS;
+  if (!AI_VERIFIER) throw new Error("❌ Set AI_VERIFIER_ADDRESS in .env");
+
+  console.log(`🤖 AI Verifier: ${AI_VERIFIER}`);
+
+  const BuildProof = await ethers.getContractFactory("BuildProofNFT");
+  const bp = await BuildProof.deploy(AI_VERIFIER);
   await bp.waitForDeployment();
-  const addr = await bp.getAddress();
-  console.log("Deployed:", addr);
-  const sr = await ethers.getContractAt(
+
+  const address = await bp.getAddress();
+  console.log(`✅ BuildProofNFT deployed to: ${address}`);
+
+  const schemaRegistry = await ethers.getContractAt(
     ["function register(string,address,bool) returns (bytes32)"],
     "0x4200000000000000000000000000000000000020"
   );
-  await (await sr.register("string projectName,string description,string githubUrl,string category,uint8 aiScore",ethers.ZeroAddress,false)).wait();
-  console.log("EAS schema registered");
-  await new Promise(r=>setTimeout(r,30000));
-  try { await run("verify:verify",{address:addr,constructorArguments:[AI]}); } catch {}
-  console.log("Done — update BUILDPROOF_CONTRACT in lib/contract.ts:", addr);
+  const schemaTx = await schemaRegistry.register(
+    "string projectName,string description,string githubUrl,string category,uint8 aiScore",
+    ethers.ZeroAddress,
+    false
+  );
+  await schemaTx.wait();
+  console.log(`📜 EAS Schema registered`);
+
+  console.log(`⏳ Waiting 30s for Basescan indexing...`);
+  await new Promise((r) => setTimeout(r, 30000));
+
+  try {
+    await run("verify:verify", { address, constructorArguments: [AI_VERIFIER] });
+    console.log(`✅ Contract verified on Basescan`);
+  } catch (err) {
+    console.log(`⚠️ Verification skipped or failed`);
+  }
+
+  console.log(`\n🎉 Deployment complete!`);
+  console.log(`📊 Contract: ${address}`);
+  console.log(`🔍 Basescan: https://basescan.org/address/${address}`);
 }
-main().catch(console.error);
+
+main().catch((error) => {
+  console.error("💥 Deployment failed:", error);
+  process.exit(1);
+});
