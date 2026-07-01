@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.25;
-// BuildProof Registry v1.0
+// BuildProof Registry v1.1
 // Onchain Proof-of-Work for Builders on Base
 // Owner: afifarioss.base.eth / 0x7845D45d9E53268EBFf3C4a9daBb994cE5b93918
 
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/token/ERC721/ERC721.sol";
-import "@openzeppelin/contracts/utils/Counters.sol";
 
 interface IEAS {
     struct AttestationRequest { bytes32 schema; AttestationRequestData data; }
@@ -20,8 +20,10 @@ interface IEAS {
 interface ITalentProtocol { function getBuilderScore(address b) external view returns (uint256); }
 
 contract BuildProofNFT is ERC721, Ownable {
-    using Counters for Counters.Counter;
-    Counters.Counter private _ids;
+    using SafeERC20 for IERC20;
+
+    // ── State ──────────────────────────────────────────────
+    uint256 private _nextId;
 
     struct ShipReceipt {
         address builder; string projectName; string description;
@@ -33,6 +35,7 @@ contract BuildProofNFT is ERC721, Ownable {
     mapping(uint256 => ShipReceipt) public receipts;
     mapping(address => uint256[])   public builderReceipts;
     mapping(address => uint256)     public builderShipCount;
+    mapping(address => uint256)     public lastMintTimestamp;
 
     address public constant USDC   = 0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913;
     address public constant EAS    = 0x4200000000000000000000000000000000000021;
@@ -44,9 +47,19 @@ contract BuildProofNFT is ERC721, Ownable {
     uint256 public constant TIP_FEE_BPS = 250;
     uint256 public totalProtocolFees;
 
-    address[] public leaderboardAddresses;
-    mapping(address => bool) public isOnLeaderboard;
+    // Anti-spam: min seconds between mints per address. Owner-tunable.
+    uint256 public mintCooldown = 1 hours;
 
+    // All builders who have ever minted (insertion order — NOT ranked).
+    // Kept for indexer/frontend use; do not treat as a leaderboard.
+    address[] public allBuilders;
+    mapping(address => bool) public hasMinted;
+
+    // Fixed-size top-N leaderboard, kept sorted by ship count on every mint.
+    uint256 public constant LEADERBOARD_SIZE = 100;
+    address[LEADERBOARD_SIZE] public topBuilders; // zero-address = empty slot
+
+    // ── Events ─────────────────────────────────────────────
     event ShipReceiptMinted(uint256 indexed tokenId, address indexed builder, string projectName, bytes32 easUID, uint256 timestamp);
     event BuildAIVerified(uint256 indexed tokenId, uint8 aiScore, bool verified);
     event TipSent(uint256 indexed tokenId, address indexed tipper, address indexed builder, uint256 amount);
@@ -56,17 +69,25 @@ contract BuildProofNFT is ERC721, Ownable {
         protocolOwner = 0x7845D45d9E53268EBFf3C4a9daBb994cE5b93918;
     }
 
+    // ── Core ───────────────────────────────────────────────
     function mintShipReceipt(
         string calldata projectName, string calldata description,
         string calldata githubUrl,   string calldata category,
         bytes  calldata easData
     ) external returns (uint256 tokenId) {
-        require(bytes(projectName).length > 0,  "BP: name required");
+        require(bytes(projectName).length > 0,   "BP: name required");
         require(bytes(description).length >= 20, "BP: desc too short");
-        _ids.increment();
-        tokenId = _ids.current();
+        require(
+            block.timestamp >= lastMintTimestamp[msg.sender] + mintCooldown,
+            "BP: cooldown active"
+        );
+        lastMintTimestamp[msg.sender] = block.timestamp;
+
+        tokenId = ++_nextId;
+
         uint256 bScore;
         try ITalentProtocol(TALENT).getBuilderScore(msg.sender) returns (uint256 s) { bScore = s; } catch {}
+
         bytes32 uid_;
         if (schemaUID != bytes32(0)) {
             IEAS.AttestationRequest memory req = IEAS.AttestationRequest({
@@ -75,12 +96,16 @@ contract BuildProofNFT is ERC721, Ownable {
             });
             try IEAS(EAS).attest(req) returns (bytes32 u) { uid_ = u; } catch {}
         }
+
         receipts[tokenId] = ShipReceipt({ builder:msg.sender, projectName:projectName, description:description,
             githubUrl:githubUrl, category:category, timestamp:block.timestamp, builderScore:bScore,
             easUID:uid_, tips:0, aiVerified:false, aiScore:0 });
         builderReceipts[msg.sender].push(tokenId);
         builderShipCount[msg.sender]++;
-        if (!isOnLeaderboard[msg.sender]) { leaderboardAddresses.push(msg.sender); isOnLeaderboard[msg.sender]=true; }
+
+        if (!hasMinted[msg.sender]) { allBuilders.push(msg.sender); hasMinted[msg.sender] = true; }
+        _updateTopBuilders(msg.sender);
+
         _safeMint(msg.sender, tokenId);
         emit ShipReceiptMinted(tokenId, msg.sender, projectName, uid_, block.timestamp);
     }
@@ -98,21 +123,70 @@ contract BuildProofNFT is ERC721, Ownable {
         ShipReceipt storage r = receipts[tokenId];
         require(r.builder != address(0), "BP: not found");
         require(r.builder != msg.sender,  "BP: no self-tip");
+
         uint256 fee = (usdcAmount * TIP_FEE_BPS) / 10_000;
-        IERC20(USDC).transferFrom(msg.sender, r.builder,     usdcAmount - fee);
-        IERC20(USDC).transferFrom(msg.sender, protocolOwner, fee);
-        receipts[tokenId].tips += usdcAmount - fee;
-        totalProtocolFees      += fee;
+        IERC20(USDC).safeTransferFrom(msg.sender, r.builder,     usdcAmount - fee);
+        IERC20(USDC).safeTransferFrom(msg.sender, protocolOwner, fee);
+
+        r.tips             += usdcAmount - fee;
+        totalProtocolFees  += fee;
         emit TipSent(tokenId, msg.sender, r.builder, usdcAmount - fee);
     }
 
-    function getLeaderboard(uint256 limit) external view returns (address[] memory b, uint256[] memory c) {
-        uint256 len = leaderboardAddresses.length < limit ? leaderboardAddresses.length : limit;
-        b = new address[](len); c = new uint256[](len);
-        for (uint256 i; i < len; i++) { b[i]=leaderboardAddresses[i]; c[i]=builderShipCount[leaderboardAddresses[i]]; }
+    // ── Leaderboard maintenance ────────────────────────────
+    // Simple insertion-into-sorted-array. O(LEADERBOARD_SIZE) worst case,
+    // bounded and cheap since LEADERBOARD_SIZE is fixed at 100.
+    function _updateTopBuilders(address builder) internal {
+        uint256 score = builderShipCount[builder];
+
+        // Already ranked? Bubble to correct position.
+        for (uint256 i; i < LEADERBOARD_SIZE; i++) {
+            if (topBuilders[i] == builder) {
+                while (i > 0 && builderShipCount[topBuilders[i - 1]] < score) {
+                    (topBuilders[i - 1], topBuilders[i]) = (topBuilders[i], topBuilders[i - 1]);
+                    i--;
+                }
+                return;
+            }
+        }
+
+        // Not yet ranked — try to insert.
+        for (uint256 i; i < LEADERBOARD_SIZE; i++) {
+            if (topBuilders[i] == address(0) || builderShipCount[topBuilders[i]] < score) {
+                for (uint256 j = LEADERBOARD_SIZE - 1; j > i; j--) {
+                    topBuilders[j] = topBuilders[j - 1];
+                }
+                topBuilders[i] = builder;
+                return;
+            }
+        }
     }
+
+    // ── Views ──────────────────────────────────────────────
+    /// @notice True leaderboard, sorted by ship count descending, capped at LEADERBOARD_SIZE.
+    function getLeaderboard(uint256 limit) external view returns (address[] memory b, uint256[] memory c) {
+        uint256 len = limit < LEADERBOARD_SIZE ? limit : LEADERBOARD_SIZE;
+        uint256 actual;
+        for (uint256 i; i < len; i++) {
+            if (topBuilders[i] == address(0)) break;
+            actual++;
+        }
+        b = new address[](actual);
+        c = new uint256[](actual);
+        for (uint256 i; i < actual; i++) {
+            b[i] = topBuilders[i];
+            c[i] = builderShipCount[topBuilders[i]];
+        }
+    }
+
+    /// @notice All builders who have ever minted, in insertion order. Not ranked — use for indexing only.
+    function getAllBuilders() external view returns (address[] memory) { return allBuilders; }
+
     function getBuilderReceipts(address builder) external view returns (uint256[] memory) { return builderReceipts[builder]; }
-    function totalShips() external view returns (uint256) { return _ids.current(); }
-    function setSchemaUID(bytes32 uid) external onlyOwner { schemaUID = uid; }
-    function setAIVerifier(address v)  external onlyOwner { aiVerifier = v;  }
+    function totalShips() external view returns (uint256) { return _nextId; }
+
+    // ── Admin ──────────────────────────────────────────────
+    function setSchemaUID(bytes32 uid)      external onlyOwner { schemaUID = uid; }
+    function setAIVerifier(address v)       external onlyOwner { aiVerifier = v;  }
+    function setMintCooldown(uint256 secs)  external onlyOwner { mintCooldown = secs; }
 }
