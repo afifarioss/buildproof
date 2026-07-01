@@ -1,10 +1,50 @@
-@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700;800&display=swap');
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
-* { box-sizing: border-box; }
-body { background: #0A0A0F; color: white; font-family: 'JetBrains Mono', monospace; }
-::-webkit-scrollbar { width: 4px; }
-::-webkit-scrollbar-track { background: #111; }
+
+:root {
+  --base-blue: #0052FF;
+  --base-green: #00D26A;
+  --base-dark: #0a0a1a;
+  --base-card: #0d1b3e;
+}
+
+@layer base {
+  body {
+    background-color: var(--base-dark);
+    color: white;
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+  }
+  ::selection {
+    background-color: rgba(0, 82, 255, 0.3);
+    color: white;
+  }
+}
+
+@layer components {
+  .base-glow {
+    box-shadow: 0 0 20px rgba(0, 82, 255, 0.15), 0 0 40px rgba(0, 82, 255, 0.05);
+  }
+  .base-gradient {
+    background: linear-gradient(135deg, #0052FF 0%, #00D26A 100%);
+  }
+  .glass-card {
+    background: rgba(255, 255, 255, 0.03);
+    backdrop-filter: blur(10px);
+    border: 1px solid rgba(0, 82, 255, 0.15);
+  }
+}
+
+@layer utilities {
+  .text-gradient {
+    background: linear-gradient(135deg, #0052FF, #00D26A);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+  }
+}
+
+::-webkit-scrollbar { width: 8px; }
+::-webkit-scrollbar-track { background: #0a0a1a; }
 ::-webkit-scrollbar-thumb { background: #0052FF; border-radius: 4px; }
-.line-clamp-2 { display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden; }
+::-webkit-scrollbar-thumb:hover { background: #0040cc; }
